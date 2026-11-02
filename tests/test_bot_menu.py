@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 from telegram import InlineKeyboardMarkup, LinkPreviewOptions, ReplyKeyboardRemove
 
 from bot import (
+    ADD_MEDICINE_BUTTON,
     FINISH_MANUAL_REMAINDER_BUTTON,
     MANUAL_REMAINDER_BUTTON,
     MENU_BUTTONS,
@@ -12,6 +13,7 @@ from bot import (
     _format_remainder_report,
     _process_menu_action,
     finish_manual_remainder_callback,
+    medicine_creation_callback,
     manual_remainder_callback,
     menu_action,
     menu_callback,
@@ -96,6 +98,110 @@ class MedicinesMenuTests(unittest.IsolatedAsyncioTestCase):
             await menu_action(update, context)
 
         search.assert_called_once_with("тЕсТ")
+
+    async def test_new_medicine_form_keeps_draft_until_save_and_returns_to_review(self) -> None:
+        message = _FakeMessage()
+        context = SimpleNamespace(user_data={})
+        menu_query = SimpleNamespace(
+            answer=AsyncMock(),
+            message=message,
+            data=f"medicines:{MENU_BUTTONS.index(ADD_MEDICINE_BUTTON)}",
+        )
+        menu_update = SimpleNamespace(
+            callback_query=menu_query,
+            effective_user=SimpleNamespace(id=42),
+        )
+
+        with patch("bot.Message", _FakeMessage), patch("bot._admin_id", return_value=42):
+            await menu_callback(menu_update, context)
+
+        menu_query.answer.assert_awaited_once()
+        first_keyboard = message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(first_keyboard.inline_keyboard[0][0].text, "Назад")
+
+        update = SimpleNamespace(
+            effective_message=message,
+            effective_user=SimpleNamespace(id=42),
+        )
+        answers_before_optional = (
+            "Test medicine",
+            "bottle",
+            "05.12.2027",
+        )
+        for answer in answers_before_optional:
+            message.text = answer
+            await menu_action(update, context)
+
+        for _ in range(2):
+            skip_query = SimpleNamespace(
+                answer=AsyncMock(),
+                message=message,
+                data="medicine:create:skip",
+            )
+            skip_update = SimpleNamespace(
+                callback_query=skip_query,
+                effective_user=SimpleNamespace(id=42),
+            )
+            with patch("bot.Message", _FakeMessage), patch("bot._admin_id", return_value=42):
+                await medicine_creation_callback(skip_update, context)
+
+        self.assertIsNone(context.user_data["medicine_creation"]["draft"]["Instruction"])
+        self.assertIsNone(context.user_data["medicine_creation"]["draft"]["Photo"])
+
+        answers_after_optional = (
+            "12.5",
+            "Test manufacturer",
+            "2.25",
+            "Original seller",
+        )
+        for answer in answers_after_optional:
+            message.text = answer
+            await menu_action(update, context)
+
+        self.assertEqual(context.user_data["medicine_creation"]["step"], "review")
+        self.assertIn("Original seller", message.reply_text.await_args.args[0])
+
+        back_query = SimpleNamespace(
+            answer=AsyncMock(),
+            message=message,
+            data="medicine:create:back",
+        )
+        back_update = SimpleNamespace(
+            callback_query=back_query,
+            effective_user=SimpleNamespace(id=42),
+        )
+        with patch("bot.Message", _FakeMessage), patch("bot._admin_id", return_value=42):
+            await medicine_creation_callback(back_update, context)
+
+        self.assertIn("Введите предприятие-продавца", message.reply_text.await_args.args[0])
+        message.text = "Corrected seller"
+        await menu_action(update, context)
+        self.assertIn("Corrected seller", message.reply_text.await_args.args[0])
+        self.assertEqual(context.user_data["medicine_creation"]["step"], "review")
+
+        save_query = SimpleNamespace(
+            answer=AsyncMock(),
+            message=message,
+            data="medicine:create:save",
+        )
+        save_update = SimpleNamespace(
+            callback_query=save_query,
+            effective_user=SimpleNamespace(id=42),
+        )
+        with (
+            patch("bot.Message", _FakeMessage),
+            patch("bot._admin_id", return_value=42),
+            patch("bot.save_medicine", return_value=1) as save,
+        ):
+            await medicine_creation_callback(save_update, context)
+
+        save.assert_called_once()
+        self.assertEqual(save.call_args.args[0]["Salesman"], "Corrected seller")
+        self.assertNotIn("medicine_creation", context.user_data)
+        self.assertEqual(
+            message.reply_text.await_args.args[0],
+            "Информация о препарате записана в базу данных.",
+        )
 
     def test_remainder_report_explicitly_shows_missing_and_skipped_rows(self) -> None:
         report = _format_remainder_report(

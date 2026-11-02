@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import sqlite3
 import tempfile
 from decimal import Decimal, InvalidOperation
 from math import isfinite
@@ -40,6 +41,12 @@ from src.steps.step_three import (
     search_medicines_by_prefix,
     update_medicine_remainder,
 )
+from src.steps.step_four import (
+    MEDICINE_FIELDS,
+    MedicineField,
+    save_medicine,
+    validate_medicine_field,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -48,11 +55,12 @@ IMPORT_BUTTON = "Автоматический ввод препаратов"
 REMAINDER_BUTTON = "Автоматический ввод остатков"
 MANUAL_REMAINDER_BUTTON = "Ручное изменение остатков"
 FINISH_MANUAL_REMAINDER_BUTTON = "Завершить ввод остатков"
+ADD_MEDICINE_BUTTON = "Ввод нового препарата"
 MENU_BUTTONS = (
     IMPORT_BUTTON,
     REMAINDER_BUTTON,
     MANUAL_REMAINDER_BUTTON,
-    "Ввод нового препарата",
+    ADD_MEDICINE_BUTTON,
     "Изменение характеристик препарата",
     "Удаление одного препарата",
     "Удаление всех препаратов",
@@ -95,6 +103,7 @@ async def medicines(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     context.user_data.pop("awaiting_workbook_action", None)
     _clear_manual_remainder_state(context)
+    _clear_medicine_creation_state(context)
     LOGGER.info("Администратор запустил команду /medicines.")
     keyboard = [
         [InlineKeyboardButton(label, callback_data=f"medicines:{index}")]
@@ -122,6 +131,88 @@ async def menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if context.user_data.get("manual_remainder_state") in {"search", "quantity"}:
         await _process_manual_remainder_text(message, context, action)
+    elif context.user_data.get("medicine_creation") is not None:
+        await _process_medicine_creation_text(message, context, action)
+
+
+async def medicine_creation_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+
+    await query.answer()
+    message = query.message
+    if not isinstance(message, Message):
+        LOGGER.warning("Невозможно продолжить ввод препарата без доступного сообщения.")
+        return
+    if user.id != _admin_id():
+        await message.reply_text("Это действие доступно только администратору.")
+        return
+
+    form = context.user_data.get("medicine_creation")
+    if form is None:
+        await message.reply_text("Опрос не активен. Начните его через /medicines.")
+        return
+
+    action = query.data or ""
+    if action == "medicine:create:back":
+        if form["step"] == "review":
+            field_index = form["review_cursor"]
+            if field_index < 0:
+                await message.reply_text(
+                    "Вы уже вернулись к началу анкеты.",
+                    reply_markup=_medicine_review_keyboard(),
+                )
+                return
+            form["step"] = "question"
+            form["field_index"] = field_index
+            form["return_to_review"] = True
+        else:
+            field_index = form["field_index"]
+            if field_index == 0:
+                _clear_medicine_creation_state(context)
+                await message.reply_text("Добавление препарата отменено.")
+                return
+            form["field_index"] = field_index - 1
+        await _send_medicine_question(message, context)
+        return
+
+    if action == "medicine:create:skip":
+        if form["step"] != "question":
+            return
+        field = MEDICINE_FIELDS[form["field_index"]]
+        if field.required:
+            await message.reply_text(
+                "Это обязательное поле. Нажмите «Назад» или введите значение."
+            )
+            return
+        await _accept_medicine_answer(message, context, field, None)
+        return
+
+    if action == "medicine:create:save":
+        if form["step"] != "review":
+            return
+        try:
+            await asyncio.to_thread(save_medicine, form["draft"])
+        except ValueError as error:
+            await message.reply_text(
+                f"Не удалось сохранить анкету: {error}",
+                reply_markup=_medicine_review_keyboard(),
+            )
+            return
+        except sqlite3.Error:
+            LOGGER.exception("Не удалось сохранить новый препарат в базе данных.")
+            await message.reply_text(
+                "Не удалось записать препарат в базу данных. "
+                "Данные анкеты сохранены; попробуйте сохранить еще раз."
+            )
+            return
+        _clear_medicine_creation_state(context)
+        await message.reply_text("Информация о препарате записана в базу данных.")
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -221,12 +312,14 @@ async def _process_menu_action(
         return
 
     if action == IMPORT_BUTTON:
+        _clear_medicine_creation_state(context)
         _clear_manual_remainder_state(context)
         context.user_data["awaiting_workbook_action"] = "medicines"
         await message.reply_text("Отправьте документ .xlsx, .xls или .ods без строки заголовков.")
         return
 
     if action == REMAINDER_BUTTON:
+        _clear_medicine_creation_state(context)
         _clear_manual_remainder_state(context)
         context.user_data["awaiting_workbook_action"] = "remainders"
         await message.reply_text(
@@ -236,6 +329,7 @@ async def _process_menu_action(
         return
 
     if action == MANUAL_REMAINDER_BUTTON:
+        _clear_medicine_creation_state(context)
         context.user_data.pop("awaiting_workbook_action", None)
         _clear_manual_remainder_state(context)
         context.user_data["manual_remainder_state"] = "search"
@@ -244,6 +338,20 @@ async def _process_menu_action(
         )
         return
 
+    if action == ADD_MEDICINE_BUTTON:
+        context.user_data.pop("awaiting_workbook_action", None)
+        _clear_manual_remainder_state(context)
+        context.user_data["medicine_creation"] = {
+            "step": "question",
+            "field_index": 0,
+            "review_cursor": len(MEDICINE_FIELDS) - 1,
+            "return_to_review": False,
+            "draft": {},
+        }
+        await _send_medicine_question(message, context)
+        return
+
+    _clear_medicine_creation_state(context)
     _clear_manual_remainder_state(context)
     context.user_data.pop("awaiting_workbook_action", None)
     await message.reply_text("Эта функция будет реализована по отдельному техническому заданию.")
@@ -317,6 +425,118 @@ async def _process_manual_remainder_text(
                 ]
             ]
         ),
+    )
+
+
+def _clear_medicine_creation_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("medicine_creation", None)
+
+
+def _medicine_question_keyboard(field: MedicineField) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton("Назад", callback_data="medicine:create:back")
+    ]
+    if not field.required:
+        buttons.append(
+            InlineKeyboardButton("Пропустить", callback_data="medicine:create:skip")
+        )
+    return InlineKeyboardMarkup([buttons])
+
+
+def _medicine_review_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Назад", callback_data="medicine:create:back"),
+                InlineKeyboardButton("Сохранить", callback_data="medicine:create:save"),
+            ]
+        ]
+    )
+
+
+async def _send_medicine_question(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    form = context.user_data["medicine_creation"]
+    field = MEDICINE_FIELDS[form["field_index"]]
+    current_value = form["draft"].get(field.key)
+    prompt = field.prompt
+    if current_value is not None:
+        prompt += f"\nТекущее значение: {current_value}"
+    await message.reply_text(
+        prompt,
+        reply_markup=_medicine_question_keyboard(field),
+    )
+
+
+async def _process_medicine_creation_text(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> None:
+    form = context.user_data["medicine_creation"]
+    if form["step"] != "question":
+        await message.reply_text(
+            "Проверьте введенные данные и нажмите «Сохранить» либо «Назад».",
+            reply_markup=_medicine_review_keyboard(),
+        )
+        return
+
+    field = MEDICINE_FIELDS[form["field_index"]]
+    try:
+        value = validate_medicine_field(field, text)
+    except ValueError as error:
+        await message.reply_text(
+            f"{error}\n{field.prompt}",
+            reply_markup=_medicine_question_keyboard(field),
+        )
+        return
+    await _accept_medicine_answer(message, context, field, value)
+
+
+async def _accept_medicine_answer(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    field: MedicineField,
+    value: str | float | None,
+) -> None:
+    form = context.user_data["medicine_creation"]
+    form["draft"][field.key] = value
+    field_index = form["field_index"]
+    if form["return_to_review"]:
+        form["step"] = "review"
+        form["return_to_review"] = False
+        form["review_cursor"] = field_index - 1
+        await _send_medicine_review(message, context)
+        return
+
+    next_index = field_index + 1
+    if next_index < len(MEDICINE_FIELDS):
+        form["field_index"] = next_index
+        await _send_medicine_question(message, context)
+        return
+
+    form["step"] = "review"
+    form["review_cursor"] = len(MEDICINE_FIELDS) - 1
+    await _send_medicine_review(message, context)
+
+
+async def _send_medicine_review(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    draft = context.user_data["medicine_creation"]["draft"]
+    lines = ["Проверьте правильность введенной информации:"]
+    for field in MEDICINE_FIELDS:
+        value = draft.get(field.key)
+        lines.append(f"{field.label}: {value if value is not None else 'не указано'}")
+    parts = _split_telegram_message("\n".join(lines))
+    for part in parts[:-1]:
+        await message.reply_text(part)
+    await message.reply_text(
+        parts[-1],
+        reply_markup=_medicine_review_keyboard(),
     )
 
 
@@ -638,6 +858,12 @@ def main() -> None:
         CallbackQueryHandler(
             finish_manual_remainder_callback,
             pattern=r"^remainder:finish$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            medicine_creation_callback,
+            pattern=r"^medicine:create:(back|skip|save)$",
         )
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_action))
