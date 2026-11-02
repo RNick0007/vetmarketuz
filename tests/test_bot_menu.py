@@ -2,16 +2,29 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from telegram import InlineKeyboardMarkup, ReplyKeyboardRemove
+from telegram import InlineKeyboardMarkup, LinkPreviewOptions, ReplyKeyboardRemove
 
 from bot import (
+    FINISH_MANUAL_REMAINDER_BUTTON,
+    MANUAL_REMAINDER_BUTTON,
     MENU_BUTTONS,
     REMAINDER_BUTTON,
     _format_remainder_report,
     _process_menu_action,
+    finish_manual_remainder_callback,
+    manual_remainder_callback,
+    menu_action,
+    menu_callback,
     medicines,
 )
+from src.steps.step_three import MedicineRecord
 from src.steps.step_two import RemainderImportResult
+
+
+class _FakeMessage:
+    def __init__(self) -> None:
+        self.reply_text = AsyncMock()
+        self.reply_photo = AsyncMock()
 
 
 class MedicinesMenuTests(unittest.IsolatedAsyncioTestCase):
@@ -23,7 +36,7 @@ class MedicinesMenuTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("bot._admin_id", return_value=42):
-            await medicines(update, SimpleNamespace())
+            await medicines(update, SimpleNamespace(user_data={}))
 
         self.assertEqual(message.reply_text.await_count, 2)
         self.assertIsInstance(
@@ -52,6 +65,38 @@ class MedicinesMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.user_data["awaiting_workbook_action"], "remainders")
         self.assertIn("столбце B", message.reply_text.await_args.args[0])
 
+    async def test_manual_remainder_menu_callback_starts_case_insensitive_search(self) -> None:
+        message = _FakeMessage()
+        query = SimpleNamespace(
+            answer=AsyncMock(),
+            message=message,
+            data=f"medicines:{MENU_BUTTONS.index(MANUAL_REMAINDER_BUTTON)}",
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+        )
+        context = SimpleNamespace(user_data={})
+
+        with patch("bot.Message", _FakeMessage), patch("bot._admin_id", return_value=42):
+            await menu_callback(update, context)
+
+        query.answer.assert_awaited_once()
+        self.assertEqual(context.user_data["manual_remainder_state"], "search")
+        self.assertIn("начальных букв", message.reply_text.await_args.args[0])
+
+        with (
+            patch("bot._admin_id", return_value=42),
+            patch("bot.search_medicines_by_prefix", return_value=()) as search,
+        ):
+            update = SimpleNamespace(
+                effective_message=SimpleNamespace(text="тЕсТ", reply_text=AsyncMock()),
+                effective_user=SimpleNamespace(id=42),
+            )
+            await menu_action(update, context)
+
+        search.assert_called_once_with("тЕсТ")
+
     def test_remainder_report_explicitly_shows_missing_and_skipped_rows(self) -> None:
         report = _format_remainder_report(
             RemainderImportResult(
@@ -65,6 +110,109 @@ class MedicinesMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Не найдены в базе данных: нет.", report)
         self.assertIn("Пропущенные строки (1):", report)
         self.assertIn("Coglavax 250 ml", report)
+
+    async def test_manual_remainder_search_select_and_update(self) -> None:
+        medicine = MedicineRecord(
+            id=5,
+            name="Тестовый препарат",
+            unit="флакон",
+            before="01.01.2028",
+            instruction="https://example.test/instruction",
+            photo="https://example.test/photo.jpg",
+            price=12.5,
+            manufacturer="ВетФарм",
+            remainder=1,
+            salesman="Vetco",
+        )
+        message = _FakeMessage()
+        context = SimpleNamespace(user_data={})
+        update = SimpleNamespace(
+            effective_message=message,
+            effective_user=SimpleNamespace(id=42),
+        )
+
+        with patch("bot._admin_id", return_value=42):
+            await _process_menu_action(message, context, 42, MANUAL_REMAINDER_BUTTON)
+
+        self.assertEqual(context.user_data["manual_remainder_state"], "search")
+
+        with (
+            patch("bot._admin_id", return_value=42),
+            patch("bot.search_medicines_by_prefix", return_value=(medicine,)),
+        ):
+            update.effective_message.text = "Тест"
+            await menu_action(update, context)
+
+        markup = message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].text, medicine.name)
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "remainder:select:5")
+
+        query = SimpleNamespace(
+            answer=AsyncMock(),
+            message=message,
+            data="remainder:select:5",
+        )
+        callback_update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+        )
+        with (
+            patch("bot.Message", _FakeMessage),
+            patch("bot._admin_id", return_value=42),
+            patch("bot.get_medicine", return_value=medicine),
+        ):
+            await manual_remainder_callback(callback_update, context)
+
+        message.reply_photo.assert_awaited_once_with(photo=medicine.photo)
+        self.assertIn("Производитель: ВетФарм", message.reply_text.await_args_list[-2].args[0])
+        self.assertEqual(
+            message.reply_text.await_args_list[-2].kwargs["link_preview_options"],
+            LinkPreviewOptions(is_disabled=True),
+        )
+        self.assertEqual(context.user_data["manual_remainder_state"], "quantity")
+
+        with (
+            patch("bot._admin_id", return_value=42),
+            patch("bot.update_medicine_remainder", return_value=medicine.name) as update_remainder,
+        ):
+            update.effective_message.text = "2,5"
+            await menu_action(update, context)
+
+        update_remainder.assert_called_once_with(5, 2.5)
+        self.assertIn("Остаток препарата Тестовый препарат: 2.5", message.reply_text.await_args.args[0])
+        self.assertIn("Введите начальные буквы следующего препарата", message.reply_text.await_args.args[0])
+        self.assertEqual(context.user_data["manual_remainder_state"], "search")
+        self.assertNotIn("manual_remainder_medicine_id", context.user_data)
+        finish_markup = message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            finish_markup.inline_keyboard[0][0].text,
+            FINISH_MANUAL_REMAINDER_BUTTON,
+        )
+
+        with (
+            patch("bot._admin_id", return_value=42),
+            patch("bot.search_medicines_by_prefix", return_value=()) as search,
+        ):
+            update.effective_message.text = "Следующий"
+            await menu_action(update, context)
+
+        search.assert_called_once_with("Следующий")
+
+        finish_query = SimpleNamespace(
+            answer=AsyncMock(),
+            message=message,
+            data="remainder:finish",
+        )
+        finish_update = SimpleNamespace(
+            callback_query=finish_query,
+            effective_user=SimpleNamespace(id=42),
+        )
+        with patch("bot.Message", _FakeMessage), patch("bot._admin_id", return_value=42):
+            await finish_manual_remainder_callback(finish_update, context)
+
+        finish_query.answer.assert_awaited_once()
+        self.assertNotIn("manual_remainder_state", context.user_data)
+        self.assertEqual(message.reply_text.await_args.args[0], "Ввод остатков завершен.")
 
 
 if __name__ == "__main__":

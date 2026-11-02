@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import tempfile
+from decimal import Decimal, InvalidOperation
+from math import isfinite
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -11,11 +13,12 @@ from telegram import (
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     Message,
     ReplyKeyboardRemove,
     Update,
 )
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -27,17 +30,28 @@ from telegram.ext import (
 )
 
 from src.databases.steps.step_one import enrich_medicine_info, import_medicine_workbook
-from src.steps.step_two import RemainderImportResult, import_remainders_workbook
+from src.steps.step_two import (
+    RemainderImportResult,
+    import_remainders_workbook,
+)
+from src.steps.step_three import (
+    MedicineRecord,
+    get_medicine,
+    search_medicines_by_prefix,
+    update_medicine_remainder,
+)
 
 
 LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent
 IMPORT_BUTTON = "Автоматический ввод препаратов"
 REMAINDER_BUTTON = "Автоматический ввод остатков"
+MANUAL_REMAINDER_BUTTON = "Ручное изменение остатков"
+FINISH_MANUAL_REMAINDER_BUTTON = "Завершить ввод остатков"
 MENU_BUTTONS = (
     IMPORT_BUTTON,
     REMAINDER_BUTTON,
-    "Ручное изменение остатков",
+    MANUAL_REMAINDER_BUTTON,
     "Ввод нового препарата",
     "Изменение характеристик препарата",
     "Удаление одного препарата",
@@ -79,6 +93,8 @@ async def medicines(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("Команда доступна только администратору.")
         return
 
+    context.user_data.pop("awaiting_workbook_action", None)
+    _clear_manual_remainder_state(context)
     LOGGER.info("Администратор запустил команду /medicines.")
     keyboard = [
         [InlineKeyboardButton(label, callback_data=f"medicines:{index}")]
@@ -100,10 +116,12 @@ async def menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if message is None or user is None:
         return
     action = (message.text or "").strip()
-    if action not in MENU_BUTTONS:
+    if action in MENU_BUTTONS:
+        await _process_menu_action(message, context, user.id, action)
         return
 
-    await _process_menu_action(message, context, user.id, action)
+    if context.user_data.get("manual_remainder_state") in {"search", "quantity"}:
+        await _process_manual_remainder_text(message, context, action)
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -129,6 +147,69 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _process_menu_action(message, context, user.id, MENU_BUTTONS[index])
 
 
+async def manual_remainder_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+
+    await query.answer()
+    message = query.message
+    if not isinstance(message, Message):
+        LOGGER.warning("Невозможно выбрать препарат без доступного сообщения.")
+        return
+    if user.id != _admin_id():
+        await message.reply_text("Это действие доступно только администратору.")
+        return
+
+    if context.user_data.get("manual_remainder_state") != "search":
+        await message.reply_text("Сначала начните ручное изменение остатков через /medicines.")
+        return
+
+    callback_data = query.data or ""
+    _, _, medicine_id_text = callback_data.partition(":select:")
+    if not medicine_id_text.isdigit():
+        return
+    medicine = await asyncio.to_thread(get_medicine, int(medicine_id_text))
+    if medicine is None:
+        _clear_manual_remainder_state(context)
+        await message.reply_text("Препарат больше не найден в базе. Начните поиск заново.")
+        return
+
+    context.user_data["manual_remainder_medicine_id"] = medicine.id
+    context.user_data["manual_remainder_state"] = "quantity"
+    await _send_medicine_card(message, medicine)
+    await message.reply_text("Введите новый остаток препарата числом и отправьте сообщение.")
+
+
+async def finish_manual_remainder_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+
+    await query.answer()
+    message = query.message
+    if not isinstance(message, Message):
+        LOGGER.warning("Невозможно завершить ввод остатков без доступного сообщения.")
+        return
+    if user.id != _admin_id():
+        await message.reply_text("Это действие доступно только администратору.")
+        return
+    if context.user_data.get("manual_remainder_state") not in {"search", "quantity"}:
+        await message.reply_text("Режим ручного изменения остатков уже завершен.")
+        return
+
+    _clear_manual_remainder_state(context)
+    await message.reply_text("Ввод остатков завершен.")
+
+
 async def _process_menu_action(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -140,11 +221,13 @@ async def _process_menu_action(
         return
 
     if action == IMPORT_BUTTON:
+        _clear_manual_remainder_state(context)
         context.user_data["awaiting_workbook_action"] = "medicines"
         await message.reply_text("Отправьте документ .xlsx, .xls или .ods без строки заголовков.")
         return
 
     if action == REMAINDER_BUTTON:
+        _clear_manual_remainder_state(context)
         context.user_data["awaiting_workbook_action"] = "remainders"
         await message.reply_text(
             "Отправьте документ .xlsx, .xls или .ods без строки заголовков. "
@@ -152,8 +235,155 @@ async def _process_menu_action(
         )
         return
 
+    if action == MANUAL_REMAINDER_BUTTON:
+        context.user_data.pop("awaiting_workbook_action", None)
+        _clear_manual_remainder_state(context)
+        context.user_data["manual_remainder_state"] = "search"
+        await message.reply_text(
+            "Введите несколько начальных букв наименования препарата и отправьте сообщение."
+        )
+        return
+
+    _clear_manual_remainder_state(context)
     context.user_data.pop("awaiting_workbook_action", None)
     await message.reply_text("Эта функция будет реализована по отдельному техническому заданию.")
+
+
+async def _process_manual_remainder_text(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> None:
+    state = context.user_data.get("manual_remainder_state")
+    if state == "search":
+        if not text:
+            await message.reply_text("Введите несколько начальных букв наименования препарата.")
+            return
+
+        matches = await asyncio.to_thread(search_medicines_by_prefix, text)
+        if not matches:
+            await message.reply_text(
+                "Препараты с таким началом наименования не найдены. Попробуйте еще раз."
+            )
+            return
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    medicine.name if len(medicine.name) <= 64 else medicine.name[:61] + "...",
+                    callback_data=f"remainder:select:{medicine.id}",
+                )
+            ]
+            for medicine in matches
+        ]
+        response = "Выберите препарат:"
+        if len(matches) == 20:
+            response += " показаны первые 20 совпадений, уточните поиск при необходимости."
+        await message.reply_text(response, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    medicine_id = context.user_data.get("manual_remainder_medicine_id")
+    if not text or medicine_id is None:
+        await message.reply_text("Введите остаток препарата числом.")
+        return
+
+    try:
+        remainder = _parse_manual_remainder(text)
+        medicine_name = await asyncio.to_thread(
+            update_medicine_remainder,
+            medicine_id,
+            remainder,
+        )
+    except ValueError as error:
+        await message.reply_text(str(error))
+        return
+    except LookupError:
+        _clear_manual_remainder_state(context)
+        await message.reply_text("Препарат больше не найден в базе. Начните поиск заново.")
+        return
+
+    _clear_manual_remainder_state(context)
+    context.user_data["manual_remainder_state"] = "search"
+    await message.reply_text(
+        f"Остаток препарата {medicine_name}: {_format_remainder_quantity(remainder)}\n\n"
+        "Введите начальные буквы следующего препарата или завершите ввод остатков.",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        FINISH_MANUAL_REMAINDER_BUTTON,
+                        callback_data="remainder:finish",
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+def _clear_manual_remainder_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("manual_remainder_state", None)
+    context.user_data.pop("manual_remainder_medicine_id", None)
+
+
+def _parse_manual_remainder(value: str) -> float:
+    try:
+        quantity = Decimal(value.strip().replace(" ", "").replace(",", "."))
+        if (
+            not quantity.is_finite()
+            or quantity < 0
+            or quantity != quantity.quantize(Decimal("0.01"))
+        ):
+            raise ValueError(
+                "Остаток должен быть неотрицательным числом не более чем "
+                "с двумя знаками после запятой."
+            )
+    except InvalidOperation as error:
+        raise ValueError(
+            "Введите корректное неотрицательное число, например 12 или 2,5."
+        ) from error
+    try:
+        parsed_quantity = float(quantity)
+    except OverflowError as error:
+        raise ValueError("Указанный остаток слишком велик.") from error
+    if not isfinite(parsed_quantity):
+        raise ValueError("Указанный остаток слишком велик.")
+    return parsed_quantity
+
+
+def _format_remainder_quantity(quantity: float) -> str:
+    return f"{quantity:g}"
+
+
+async def _send_medicine_card(message: Message, medicine: MedicineRecord) -> None:
+    photo = medicine.photo.strip() if medicine.photo else ""
+    if photo:
+        try:
+            await message.reply_photo(photo=photo)
+        except TelegramError:
+            LOGGER.exception("Не удалось загрузить фото препарата %r.", medicine.name)
+            photo = f"ссылка: {photo}"
+    else:
+        photo = "не указано"
+
+    def display(value: object | None) -> str:
+        return "не указано" if value is None or not str(value).strip() else str(value)
+
+    card = (
+        f"Фото: {photo}\n"
+        f"Наименование: {medicine.name}\n"
+        f"Единица измерения: {display(medicine.unit)}\n"
+        f"Срок годности: {display(medicine.before)}\n"
+        f"Инструкция: {display(medicine.instruction)}\n"
+        f"Цена: {display(medicine.price)}\n"
+        f"Производитель: {display(medicine.manufacturer)}\n"
+        f"Остаток: {display(medicine.remainder)}\n"
+        f"Поставщик: {display(medicine.salesman)}"
+    )
+    for part in _split_telegram_message(card):
+        await message.reply_text(
+            part,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
 
 
 async def receive_workbook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -401,6 +631,15 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("medicines", medicines))
     application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^medicines:\d+$"))
+    application.add_handler(
+        CallbackQueryHandler(manual_remainder_callback, pattern=r"^remainder:select:\d+$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            finish_manual_remainder_callback,
+            pattern=r"^remainder:finish$",
+        )
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_action))
     application.add_handler(MessageHandler(filters.Document.ALL, receive_workbook))
     application.add_error_handler(handle_error)

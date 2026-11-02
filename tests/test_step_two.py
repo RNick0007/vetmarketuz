@@ -5,6 +5,11 @@ from pathlib import Path
 from openpyxl import Workbook
 
 from src.databases.database import connect
+from src.steps.step_three import (
+    get_medicine,
+    search_medicines_by_prefix,
+    update_medicine_remainder,
+)
 from src.steps.step_two import import_remainders_workbook
 
 
@@ -91,6 +96,45 @@ class ImportRemaindersWorkbookTests(unittest.TestCase):
     def test_invalid_workbook_extension_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "Поддерживаются только"):
             import_remainders_workbook("inventory.csv")
+
+    def test_manual_remainder_search_and_update(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "manual.db"
+            with connect(database_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE Medicines (
+                        ID INTEGER PRIMARY KEY,
+                        Name TEXT,
+                        Unit TEXT,
+                        "Before" TEXT,
+                        Instruction TEXT,
+                        Photo TEXT,
+                        Price REAL,
+                        Manufacturer TEXT,
+                        Remainder REAL,
+                        Salesman TEXT
+                    )
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO Medicines (Name, Remainder) VALUES (?, ?)",
+                    (("Тестовый препарат", 1), ("Другой товар", 4), ("Straße gel", 3)),
+                )
+
+            matches = search_medicines_by_prefix("тЕсТ", database_path)
+            expanded_case_match = search_medicines_by_prefix("STRASSE", database_path)
+
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0].name, "Тестовый препарат")
+            self.assertEqual(matches[0].remainder, 1)
+            self.assertEqual([medicine.name for medicine in expanded_case_match], ["Straße gel"])
+            self.assertEqual(update_medicine_remainder(matches[0].id, 2.5, database_path), "Тестовый препарат")
+            self.assertEqual(get_medicine(matches[0].id, database_path).remainder, 2.5)
+
+            with self.assertRaisesRegex(ValueError, "неотрицательным"):
+                update_medicine_remainder(matches[0].id, -1, database_path)
+
 
 if __name__ == "__main__":
     unittest.main()
