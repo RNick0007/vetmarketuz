@@ -6,14 +6,17 @@ from telegram import InlineKeyboardMarkup, LinkPreviewOptions, ReplyKeyboardRemo
 
 from bot import (
     ADD_MEDICINE_BUTTON,
+    EDIT_MEDICINE_BUTTON,
     FINISH_MANUAL_REMAINDER_BUTTON,
     MANUAL_REMAINDER_BUTTON,
+    MEDICINE_FIELDS,
     MENU_BUTTONS,
     REMAINDER_BUTTON,
     _format_remainder_report,
     _process_menu_action,
     finish_manual_remainder_callback,
     medicine_creation_callback,
+    medicine_edit_callback,
     manual_remainder_callback,
     menu_action,
     menu_callback,
@@ -319,6 +322,164 @@ class MedicinesMenuTests(unittest.IsolatedAsyncioTestCase):
         finish_query.answer.assert_awaited_once()
         self.assertNotIn("manual_remainder_state", context.user_data)
         self.assertEqual(message.reply_text.await_args.args[0], "Ввод остатков завершен.")
+
+    async def test_medicine_edit_search_update_and_confirmation(self) -> None:
+        medicine = MedicineRecord(
+            id=5,
+            name="Тестовый препарат",
+            unit="флакон",
+            before="01.01.2028",
+            instruction=None,
+            photo=None,
+            price=12.5,
+            manufacturer=None,
+            remainder=1,
+            salesman=None,
+        )
+        message = _FakeMessage()
+        context = SimpleNamespace(user_data={})
+        update = SimpleNamespace(
+            effective_message=message,
+            effective_user=SimpleNamespace(id=42),
+        )
+
+        with patch("bot._admin_id", return_value=42):
+            await _process_menu_action(message, context, 42, EDIT_MEDICINE_BUTTON)
+        self.assertEqual(context.user_data["medicine_edit"]["step"], "search")
+
+        with (
+            patch("bot._admin_id", return_value=42),
+            patch("bot.search_medicines_by_prefix", return_value=(medicine,)) as search,
+        ):
+            update.effective_message.text = "Тест"
+            await menu_action(update, context)
+
+        search.assert_called_once_with("Тест")
+        search_markup = message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            search_markup.inline_keyboard[0][0].callback_data,
+            "medicine:edit:select:5",
+        )
+
+        select_query = SimpleNamespace(
+            answer=AsyncMock(),
+            message=message,
+            data="medicine:edit:select:5",
+        )
+        select_update = SimpleNamespace(
+            callback_query=select_query,
+            effective_user=SimpleNamespace(id=42),
+        )
+        with (
+            patch("bot.Message", _FakeMessage),
+            patch("bot._admin_id", return_value=42),
+            patch("bot.get_medicine", return_value=medicine),
+            patch("bot._send_medicine_card", new_callable=AsyncMock),
+        ):
+            await medicine_edit_callback(select_update, context)
+
+        self.assertEqual(context.user_data["medicine_edit"]["step"], "field")
+        fields_markup = message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertTrue(
+            any(
+                button.callback_data == "medicine:edit:field:Price"
+                for row in fields_markup.inline_keyboard
+                for button in row
+            )
+        )
+
+        field_query = SimpleNamespace(
+            answer=AsyncMock(),
+            message=message,
+            data="medicine:edit:field:Price",
+        )
+        field_update = SimpleNamespace(
+            callback_query=field_query,
+            effective_user=SimpleNamespace(id=42),
+        )
+        with (
+            patch("bot.Message", _FakeMessage),
+            patch("bot._admin_id", return_value=42),
+            patch("bot.get_medicine", return_value=medicine),
+        ):
+            await medicine_edit_callback(field_update, context)
+
+        self.assertEqual(context.user_data["medicine_edit"]["step"], "value")
+        update.effective_message.text = "14,50"
+        with patch("bot._admin_id", return_value=42):
+            await menu_action(update, context)
+
+        self.assertEqual(context.user_data["medicine_edit"]["step"], "confirm")
+        confirmation = message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            [button.text for button in confirmation.inline_keyboard[0]],
+            ["Да", "Нет"],
+        )
+
+        confirm_query = SimpleNamespace(
+            answer=AsyncMock(),
+            message=message,
+            data="medicine:edit:confirm:yes",
+        )
+        confirm_update = SimpleNamespace(
+            callback_query=confirm_query,
+            effective_user=SimpleNamespace(id=42),
+        )
+        with (
+            patch("bot.Message", _FakeMessage),
+            patch("bot._admin_id", return_value=42),
+            patch(
+                "bot.update_medicine_field",
+                return_value=(
+                    next(field for field in MEDICINE_FIELDS if field.key == "Price"),
+                    14.5,
+                ),
+            ) as update_field,
+        ):
+            await medicine_edit_callback(confirm_update, context)
+
+        update_field.assert_called_once_with(5, "Price", "14,50")
+        self.assertNotIn("medicine_edit", context.user_data)
+        self.assertEqual(
+            message.reply_text.await_args.args[0],
+            "Значение поля Цена изменено на 14.5.",
+        )
+
+    async def test_medicine_edit_decline_does_not_update_database(self) -> None:
+        message = _FakeMessage()
+        context = SimpleNamespace(
+            user_data={
+                "medicine_edit": {
+                    "step": "confirm",
+                    "medicine_id": 5,
+                    "field_key": "Price",
+                    "raw_value": "14.50",
+                }
+            }
+        )
+        query = SimpleNamespace(
+            answer=AsyncMock(),
+            message=message,
+            data="medicine:edit:confirm:no",
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+        )
+
+        with (
+            patch("bot.Message", _FakeMessage),
+            patch("bot._admin_id", return_value=42),
+            patch("bot.update_medicine_field") as update_field,
+        ):
+            await medicine_edit_callback(update, context)
+
+        update_field.assert_not_called()
+        self.assertNotIn("medicine_edit", context.user_data)
+        self.assertEqual(
+            message.reply_text.await_args.args[0],
+            "Изменение отменено. Данные не изменены.",
+        )
 
 
 if __name__ == "__main__":

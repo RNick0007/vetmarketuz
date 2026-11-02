@@ -47,6 +47,7 @@ from src.steps.step_four import (
     save_medicine,
     validate_medicine_field,
 )
+from src.steps.step_five import get_medicine_field, update_medicine_field
 
 
 LOGGER = logging.getLogger(__name__)
@@ -56,12 +57,13 @@ REMAINDER_BUTTON = "Автоматический ввод остатков"
 MANUAL_REMAINDER_BUTTON = "Ручное изменение остатков"
 FINISH_MANUAL_REMAINDER_BUTTON = "Завершить ввод остатков"
 ADD_MEDICINE_BUTTON = "Ввод нового препарата"
+EDIT_MEDICINE_BUTTON = "Изменение характеристик препарата"
 MENU_BUTTONS = (
     IMPORT_BUTTON,
     REMAINDER_BUTTON,
     MANUAL_REMAINDER_BUTTON,
     ADD_MEDICINE_BUTTON,
-    "Изменение характеристик препарата",
+    EDIT_MEDICINE_BUTTON,
     "Удаление одного препарата",
     "Удаление всех препаратов",
 )
@@ -104,6 +106,7 @@ async def medicines(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_workbook_action", None)
     _clear_manual_remainder_state(context)
     _clear_medicine_creation_state(context)
+    _clear_medicine_edit_state(context)
     LOGGER.info("Администратор запустил команду /medicines.")
     keyboard = [
         [InlineKeyboardButton(label, callback_data=f"medicines:{index}")]
@@ -131,6 +134,8 @@ async def menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if context.user_data.get("manual_remainder_state") in {"search", "quantity"}:
         await _process_manual_remainder_text(message, context, action)
+    elif context.user_data.get("medicine_edit") is not None:
+        await _process_medicine_edit_text(message, context, action)
     elif context.user_data.get("medicine_creation") is not None:
         await _process_medicine_creation_text(message, context, action)
 
@@ -301,6 +306,104 @@ async def finish_manual_remainder_callback(
     await message.reply_text("Ввод остатков завершен.")
 
 
+async def medicine_edit_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+
+    await query.answer()
+    message = query.message
+    if not isinstance(message, Message):
+        LOGGER.warning("Невозможно продолжить изменение препарата без доступного сообщения.")
+        return
+    if user.id != _admin_id():
+        await message.reply_text("Это действие доступно только администратору.")
+        return
+
+    state = context.user_data.get("medicine_edit")
+    if state is None:
+        await message.reply_text("Редактирование не активно. Начните его через /medicines.")
+        return
+
+    action = query.data or ""
+    if action.startswith("medicine:edit:select:") and state["step"] == "search":
+        medicine_id_text = action.removeprefix("medicine:edit:select:")
+        if not medicine_id_text.isdigit():
+            return
+        medicine = await asyncio.to_thread(get_medicine, int(medicine_id_text))
+        if medicine is None:
+            _clear_medicine_edit_state(context)
+            await message.reply_text("Препарат больше не найден в базе. Начните поиск заново.")
+            return
+
+        state["step"] = "field"
+        state["medicine_id"] = medicine.id
+        await _send_medicine_card(message, medicine)
+        await message.reply_text(
+            "Выберете параметр, который хотите изменить:",
+            reply_markup=_medicine_edit_fields_keyboard(),
+        )
+        return
+
+    if action.startswith("medicine:edit:field:") and state["step"] == "field":
+        field_key = action.removeprefix("medicine:edit:field:")
+        try:
+            field = get_medicine_field(field_key)
+        except ValueError:
+            return
+        medicine = await asyncio.to_thread(get_medicine, state["medicine_id"])
+        if medicine is None:
+            _clear_medicine_edit_state(context)
+            await message.reply_text("Препарат больше не найден в базе. Начните поиск заново.")
+            return
+
+        current_value = getattr(medicine, field_key.casefold())
+        state["step"] = "value"
+        state["field_key"] = field.key
+        await message.reply_text(
+            f"{field.prompt}\nТекущее значение: "
+            f"{current_value if current_value is not None else 'не указано'}"
+        )
+        return
+
+    if action in {"medicine:edit:confirm:yes", "medicine:edit:confirm:no"}:
+        if state["step"] != "confirm":
+            return
+        if action.endswith(":no"):
+            _clear_medicine_edit_state(context)
+            await message.reply_text("Изменение отменено. Данные не изменены.")
+            return
+
+        try:
+            field, value = await asyncio.to_thread(
+                update_medicine_field,
+                state["medicine_id"],
+                state["field_key"],
+                state["raw_value"],
+            )
+        except LookupError:
+            _clear_medicine_edit_state(context)
+            await message.reply_text("Препарат больше не найден в базе. Начните поиск заново.")
+            return
+        except ValueError as error:
+            await message.reply_text(f"Не удалось изменить характеристику: {error}")
+            return
+        except sqlite3.Error:
+            LOGGER.exception("Не удалось изменить характеристику препарата в базе данных.")
+            await message.reply_text(
+                "Не удалось изменить значение в базе данных. "
+                "Подтвердите изменение еще раз, чтобы повторить попытку."
+            )
+            return
+
+        _clear_medicine_edit_state(context)
+        await message.reply_text(f"Значение поля {field.label} изменено на {value}.")
+
+
 async def _process_menu_action(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -310,6 +413,9 @@ async def _process_menu_action(
     if user_id != _admin_id():
         await message.reply_text("Это действие доступно только администратору.")
         return
+
+    if action != EDIT_MEDICINE_BUTTON:
+        _clear_medicine_edit_state(context)
 
     if action == IMPORT_BUTTON:
         _clear_medicine_creation_state(context)
@@ -349,6 +455,16 @@ async def _process_menu_action(
             "draft": {},
         }
         await _send_medicine_question(message, context)
+        return
+
+    if action == EDIT_MEDICINE_BUTTON:
+        _clear_medicine_creation_state(context)
+        _clear_manual_remainder_state(context)
+        context.user_data.pop("awaiting_workbook_action", None)
+        context.user_data["medicine_edit"] = {"step": "search"}
+        await message.reply_text(
+            "Введите несколько начальных букв наименования препарата и отправьте сообщение."
+        )
         return
 
     _clear_medicine_creation_state(context)
@@ -426,6 +542,85 @@ async def _process_manual_remainder_text(
             ]
         ),
     )
+
+
+async def _process_medicine_edit_text(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> None:
+    state = context.user_data["medicine_edit"]
+    if state["step"] == "search":
+        if not text:
+            await message.reply_text("Введите несколько начальных букв наименования препарата.")
+            return
+
+        matches = await asyncio.to_thread(search_medicines_by_prefix, text)
+        if not matches:
+            await message.reply_text(
+                "Препараты с таким началом наименования не найдены. Попробуйте еще раз."
+            )
+            return
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    medicine.name if len(medicine.name) <= 64 else medicine.name[:61] + "...",
+                    callback_data=f"medicine:edit:select:{medicine.id}",
+                )
+            ]
+            for medicine in matches
+        ]
+        response = "Выберите препарат:"
+        if len(matches) == 20:
+            response += " показаны первые 20 совпадений, уточните поиск при необходимости."
+        await message.reply_text(response, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if state["step"] != "value":
+        await message.reply_text("Завершите текущее изменение кнопкой «Да» или «Нет».")
+        return
+
+    field = get_medicine_field(state["field_key"])
+    try:
+        validate_medicine_field(field, text)
+    except ValueError as error:
+        await message.reply_text(f"{error}\n{field.prompt}")
+        return
+
+    state["step"] = "confirm"
+    state["raw_value"] = text.strip()
+    await message.reply_text(
+        f"Изменить значение {field.label} на {state['raw_value']}?",
+        reply_markup=_medicine_edit_confirmation_keyboard(),
+    )
+
+
+def _medicine_edit_fields_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            field.label,
+            callback_data=f"medicine:edit:field:{field.key}",
+        )
+        for field in MEDICINE_FIELDS
+    ]
+    rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(rows)
+
+
+def _medicine_edit_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Да", callback_data="medicine:edit:confirm:yes"),
+                InlineKeyboardButton("Нет", callback_data="medicine:edit:confirm:no"),
+            ]
+        ]
+    )
+
+
+def _clear_medicine_edit_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("medicine_edit", None)
 
 
 def _clear_medicine_creation_state(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -865,6 +1060,9 @@ def main() -> None:
             medicine_creation_callback,
             pattern=r"^medicine:create:(back|skip|save)$",
         )
+    )
+    application.add_handler(
+        CallbackQueryHandler(medicine_edit_callback, pattern=r"^medicine:edit:")
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_action))
     application.add_handler(MessageHandler(filters.Document.ALL, receive_workbook))
