@@ -48,6 +48,11 @@ from src.steps.step_four import (
     validate_medicine_field,
 )
 from src.steps.step_five import get_medicine_field, update_medicine_field
+from src.steps.step_six import DatabaseOptimizationError, delete_medicine
+from src.steps.step_seven import (
+    DatabaseOptimizationError as DeleteAllOptimizationError,
+    delete_all_medicines,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -58,14 +63,16 @@ MANUAL_REMAINDER_BUTTON = "Ручное изменение остатков"
 FINISH_MANUAL_REMAINDER_BUTTON = "Завершить ввод остатков"
 ADD_MEDICINE_BUTTON = "Ввод нового препарата"
 EDIT_MEDICINE_BUTTON = "Изменение характеристик препарата"
+DELETE_MEDICINE_BUTTON = "Удаление одного препарата"
+DELETE_ALL_MEDICINES_BUTTON = "Удаление всех препаратов"
 MENU_BUTTONS = (
     IMPORT_BUTTON,
     REMAINDER_BUTTON,
     MANUAL_REMAINDER_BUTTON,
     ADD_MEDICINE_BUTTON,
     EDIT_MEDICINE_BUTTON,
-    "Удаление одного препарата",
-    "Удаление всех препаратов",
+    DELETE_MEDICINE_BUTTON,
+    DELETE_ALL_MEDICINES_BUTTON,
 )
 SUPPORTED_EXTENSIONS = {".xlsx", ".xls", ".ods"}
 MAX_DOCUMENT_SIZE = 20 * 1024 * 1024
@@ -107,6 +114,8 @@ async def medicines(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _clear_manual_remainder_state(context)
     _clear_medicine_creation_state(context)
     _clear_medicine_edit_state(context)
+    _clear_medicine_delete_state(context)
+    _clear_medicine_delete_all_state(context)
     LOGGER.info("Администратор запустил команду /medicines.")
     keyboard = [
         [InlineKeyboardButton(label, callback_data=f"medicines:{index}")]
@@ -136,6 +145,8 @@ async def menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _process_manual_remainder_text(message, context, action)
     elif context.user_data.get("medicine_edit") is not None:
         await _process_medicine_edit_text(message, context, action)
+    elif context.user_data.get("medicine_delete") is not None:
+        await _process_medicine_delete_text(message, context, action)
     elif context.user_data.get("medicine_creation") is not None:
         await _process_medicine_creation_text(message, context, action)
 
@@ -404,6 +415,135 @@ async def medicine_edit_callback(
         await message.reply_text(f"Значение поля {field.label} изменено на {value}.")
 
 
+async def medicine_delete_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+
+    await query.answer()
+    message = query.message
+    if not isinstance(message, Message):
+        LOGGER.warning("Невозможно обработать удаление препарата без доступного сообщения.")
+        return
+    if user.id != _admin_id():
+        await message.reply_text("Это действие доступно только администратору.")
+        return
+
+    state = context.user_data.get("medicine_delete")
+    if state is None:
+        await message.reply_text("Удаление не активно. Начните его через /medicines.")
+        return
+
+    action = query.data or ""
+    if action.startswith("medicine:delete:select:") and state["step"] == "search":
+        medicine_id_text = action.removeprefix("medicine:delete:select:")
+        if not medicine_id_text.isdigit():
+            return
+        medicine = await asyncio.to_thread(get_medicine, int(medicine_id_text))
+        if medicine is None:
+            _clear_medicine_delete_state(context)
+            await message.reply_text("Препарат больше не найден в базе. Начните поиск заново.")
+            return
+
+        state["step"] = "confirm"
+        state["medicine_id"] = medicine.id
+        await _send_medicine_card(message, medicine)
+        await message.reply_text(
+            "Удалить препарат?",
+            reply_markup=_medicine_delete_confirmation_keyboard(),
+        )
+        return
+
+    if action not in {"medicine:delete:confirm:yes", "medicine:delete:confirm:no"}:
+        return
+    if state["step"] != "confirm":
+        return
+    if action.endswith(":no"):
+        _clear_medicine_delete_state(context)
+        await message.reply_text("Удаление отменено. Данные не изменены.")
+        return
+
+    try:
+        medicine_name = await asyncio.to_thread(delete_medicine, state["medicine_id"])
+    except LookupError:
+        _clear_medicine_delete_state(context)
+        await message.reply_text("Препарат больше не найден в базе. Начните поиск заново.")
+        return
+    except DatabaseOptimizationError:
+        LOGGER.exception("Препарат удален, но не удалось оптимизировать базу данных.")
+        _clear_medicine_delete_state(context)
+        await message.reply_text(
+            "Препарат удален, но не удалось оптимизировать базу данных. "
+            "Обратитесь к администратору базы данных."
+        )
+        return
+    except sqlite3.Error:
+        LOGGER.exception("Не удалось удалить препарат или оптимизировать базу данных.")
+        await message.reply_text(
+            "Не удалось удалить препарат или оптимизировать базу данных. "
+            "Проверьте состояние базы данных и повторите действие."
+        )
+        return
+
+    _clear_medicine_delete_state(context)
+    await message.reply_text(f"Препарат {medicine_name} удален из базы данных.")
+
+
+async def medicine_delete_all_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+
+    await query.answer()
+    message = query.message
+    if not isinstance(message, Message):
+        LOGGER.warning("Невозможно обработать удаление препаратов без доступного сообщения.")
+        return
+    if user.id != _admin_id():
+        await message.reply_text("Это действие доступно только администратору.")
+        return
+    if not context.user_data.get("medicine_delete_all"):
+        await message.reply_text("Подтверждение удаления не активно. Начните его через /medicines.")
+        return
+
+    action = query.data or ""
+    if action == "medicine:delete_all:confirm:no":
+        _clear_medicine_delete_all_state(context)
+        await message.reply_text("Удаление всех препаратов отменено. Данные не изменены.")
+        return
+    if action != "medicine:delete_all:confirm:yes":
+        return
+
+    try:
+        deleted_count = await asyncio.to_thread(delete_all_medicines)
+    except DeleteAllOptimizationError as error:
+        LOGGER.exception("Препараты удалены, но не удалось оптимизировать базу данных.")
+        _clear_medicine_delete_all_state(context)
+        await message.reply_text(
+            f"Удалено препаратов: {error.deleted_count}, но не удалось оптимизировать базу данных. "
+            "Обратитесь к администратору базы данных."
+        )
+        return
+    except sqlite3.Error:
+        LOGGER.exception("Не удалось удалить препараты из базы данных.")
+        await message.reply_text(
+            "Не удалось удалить препараты из базы данных. "
+            "Проверьте состояние базы данных и повторите действие."
+        )
+        return
+
+    _clear_medicine_delete_all_state(context)
+    await message.reply_text(f"Удаление завершено. Удалено препаратов: {deleted_count}.")
+
+
 async def _process_menu_action(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -416,6 +556,10 @@ async def _process_menu_action(
 
     if action != EDIT_MEDICINE_BUTTON:
         _clear_medicine_edit_state(context)
+    if action != DELETE_MEDICINE_BUTTON:
+        _clear_medicine_delete_state(context)
+    if action != DELETE_ALL_MEDICINES_BUTTON:
+        _clear_medicine_delete_all_state(context)
 
     if action == IMPORT_BUTTON:
         _clear_medicine_creation_state(context)
@@ -464,6 +608,27 @@ async def _process_menu_action(
         context.user_data["medicine_edit"] = {"step": "search"}
         await message.reply_text(
             "Введите несколько начальных букв наименования препарата и отправьте сообщение."
+        )
+        return
+
+    if action == DELETE_MEDICINE_BUTTON:
+        _clear_medicine_creation_state(context)
+        _clear_manual_remainder_state(context)
+        context.user_data.pop("awaiting_workbook_action", None)
+        context.user_data["medicine_delete"] = {"step": "search"}
+        await message.reply_text(
+            "Введите несколько начальных букв наименования препарата и отправьте сообщение."
+        )
+        return
+
+    if action == DELETE_ALL_MEDICINES_BUTTON:
+        _clear_medicine_creation_state(context)
+        _clear_manual_remainder_state(context)
+        context.user_data.pop("awaiting_workbook_action", None)
+        context.user_data["medicine_delete_all"] = True
+        await message.reply_text(
+            "Удалить все препараты из таблицы Medicines?",
+            reply_markup=_medicine_delete_all_confirmation_keyboard(),
         )
         return
 
@@ -596,6 +761,41 @@ async def _process_medicine_edit_text(
     )
 
 
+async def _process_medicine_delete_text(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> None:
+    state = context.user_data["medicine_delete"]
+    if state["step"] != "search":
+        await message.reply_text("Подтвердите удаление кнопкой «Да» или отмените кнопкой «Нет».")
+        return
+    if not text:
+        await message.reply_text("Введите несколько начальных букв наименования препарата.")
+        return
+
+    matches = await asyncio.to_thread(search_medicines_by_prefix, text)
+    if not matches:
+        await message.reply_text(
+            "Препараты с таким началом наименования не найдены. Попробуйте еще раз."
+        )
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                medicine.name if len(medicine.name) <= 64 else medicine.name[:61] + "...",
+                callback_data=f"medicine:delete:select:{medicine.id}",
+            )
+        ]
+        for medicine in matches
+    ]
+    response = "Выберите препарат:"
+    if len(matches) == 20:
+        response += " показаны первые 20 совпадений, уточните поиск при необходимости."
+    await message.reply_text(response, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
 def _medicine_edit_fields_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(
@@ -619,8 +819,34 @@ def _medicine_edit_confirmation_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _medicine_delete_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Да", callback_data="medicine:delete:confirm:yes"),
+            InlineKeyboardButton("Нет", callback_data="medicine:delete:confirm:no"),
+        ]]
+    )
+
+
+def _medicine_delete_all_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Да", callback_data="medicine:delete_all:confirm:yes"),
+            InlineKeyboardButton("Нет", callback_data="medicine:delete_all:confirm:no"),
+        ]]
+    )
+
+
 def _clear_medicine_edit_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("medicine_edit", None)
+
+
+def _clear_medicine_delete_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("medicine_delete", None)
+
+
+def _clear_medicine_delete_all_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("medicine_delete_all", None)
 
 
 def _clear_medicine_creation_state(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1063,6 +1289,15 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(medicine_edit_callback, pattern=r"^medicine:edit:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(medicine_delete_callback, pattern=r"^medicine:delete:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            medicine_delete_all_callback,
+            pattern=r"^medicine:delete_all:confirm:(yes|no)$",
+        )
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_action))
     application.add_handler(MessageHandler(filters.Document.ALL, receive_workbook))

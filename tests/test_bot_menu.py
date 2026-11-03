@@ -6,6 +6,8 @@ from telegram import InlineKeyboardMarkup, LinkPreviewOptions, ReplyKeyboardRemo
 
 from bot import (
     ADD_MEDICINE_BUTTON,
+    DELETE_ALL_MEDICINES_BUTTON,
+    DELETE_MEDICINE_BUTTON,
     EDIT_MEDICINE_BUTTON,
     FINISH_MANUAL_REMAINDER_BUTTON,
     MANUAL_REMAINDER_BUTTON,
@@ -16,6 +18,8 @@ from bot import (
     _process_menu_action,
     finish_manual_remainder_callback,
     medicine_creation_callback,
+    medicine_delete_callback,
+    medicine_delete_all_callback,
     medicine_edit_callback,
     manual_remainder_callback,
     menu_action,
@@ -101,6 +105,156 @@ class MedicinesMenuTests(unittest.IsolatedAsyncioTestCase):
             await menu_action(update, context)
 
         search.assert_called_once_with("тЕсТ")
+
+    async def test_delete_menu_searches_by_prefix_and_offers_matching_medicines(self) -> None:
+        message = _FakeMessage()
+        context = SimpleNamespace(user_data={})
+        with patch("bot._admin_id", return_value=42):
+            await _process_menu_action(message, context, 42, DELETE_MEDICINE_BUTTON)
+
+        self.assertEqual(context.user_data["medicine_delete"], {"step": "search"})
+        with (
+            patch("bot._admin_id", return_value=42),
+            patch("bot.search_medicines_by_prefix", return_value=(MedicineRecord(
+                7, "Тестовый препарат", "упаковка", None, None, None, 10, None, 2, None
+            ),)) as search,
+        ):
+            update = SimpleNamespace(
+                effective_message=message,
+                effective_user=SimpleNamespace(id=42),
+            )
+            message.text = "тЕсТ"
+            await menu_action(update, context)
+
+        search.assert_called_once_with("тЕсТ")
+        markup = message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            markup.inline_keyboard[0][0].callback_data,
+            "medicine:delete:select:7",
+        )
+
+    async def test_delete_selection_shows_card_and_confirmation_buttons(self) -> None:
+        message = _FakeMessage()
+        medicine = MedicineRecord(
+            7, "Тестовый препарат", "упаковка", None, None, None, 10, None, 2, None
+        )
+        context = SimpleNamespace(user_data={"medicine_delete": {"step": "search"}})
+        query = SimpleNamespace(
+            answer=AsyncMock(),
+            message=message,
+            data="medicine:delete:select:7",
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+        )
+
+        with (
+            patch("bot.Message", _FakeMessage),
+            patch("bot._admin_id", return_value=42),
+            patch("bot.get_medicine", return_value=medicine),
+            patch("bot._send_medicine_card", new_callable=AsyncMock) as send_card,
+        ):
+            await medicine_delete_callback(update, context)
+
+        send_card.assert_awaited_once_with(message, medicine)
+        self.assertEqual(context.user_data["medicine_delete"], {"step": "confirm", "medicine_id": 7})
+        self.assertEqual(message.reply_text.await_args.args[0], "Удалить препарат?")
+        markup = message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            [button.text for button in markup.inline_keyboard[0]],
+            ["Да", "Нет"],
+        )
+
+    async def test_delete_confirmation_yes_deletes_and_no_preserves_data(self) -> None:
+        for action, expected_state in (
+            ("medicine:delete:confirm:yes", None),
+            ("medicine:delete:confirm:no", None),
+        ):
+            with self.subTest(action=action):
+                message = _FakeMessage()
+                context = SimpleNamespace(
+                    user_data={"medicine_delete": {"step": "confirm", "medicine_id": 7}}
+                )
+                query = SimpleNamespace(
+                    answer=AsyncMock(),
+                    message=message,
+                    data=action,
+                )
+                update = SimpleNamespace(
+                    callback_query=query,
+                    effective_user=SimpleNamespace(id=42),
+                )
+                with (
+                    patch("bot.Message", _FakeMessage),
+                    patch("bot._admin_id", return_value=42),
+                    patch("bot.delete_medicine", return_value="Тестовый препарат") as delete,
+                ):
+                    await medicine_delete_callback(update, context)
+
+                self.assertEqual(context.user_data.get("medicine_delete"), expected_state)
+                if action.endswith(":yes"):
+                    delete.assert_called_once_with(7)
+                    self.assertIn("удален", message.reply_text.await_args.args[0])
+                else:
+                    delete.assert_not_called()
+                    self.assertIn("отменено", message.reply_text.await_args.args[0])
+
+    async def test_delete_all_menu_requests_confirmation_and_no_cancels(self) -> None:
+        message = _FakeMessage()
+        context = SimpleNamespace(user_data={})
+        with patch("bot._admin_id", return_value=42):
+            await _process_menu_action(message, context, 42, DELETE_ALL_MEDICINES_BUTTON)
+
+        self.assertTrue(context.user_data["medicine_delete_all"])
+        self.assertEqual(
+            message.reply_text.await_args.args[0],
+            "Удалить все препараты из таблицы Medicines?",
+        )
+        markup = message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            [button.text for button in markup.inline_keyboard[0]],
+            ["Да", "Нет"],
+        )
+
+        query = SimpleNamespace(
+            answer=AsyncMock(),
+            message=message,
+            data="medicine:delete_all:confirm:no",
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+        )
+        with patch("bot.Message", _FakeMessage), patch("bot._admin_id", return_value=42):
+            await medicine_delete_all_callback(update, context)
+
+        self.assertNotIn("medicine_delete_all", context.user_data)
+        self.assertIn("отменено", message.reply_text.await_args.args[0])
+
+    async def test_delete_all_confirmation_yes_deletes_all_medicines(self) -> None:
+        message = _FakeMessage()
+        context = SimpleNamespace(user_data={"medicine_delete_all": True})
+        query = SimpleNamespace(
+            answer=AsyncMock(),
+            message=message,
+            data="medicine:delete_all:confirm:yes",
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+        )
+
+        with (
+            patch("bot.Message", _FakeMessage),
+            patch("bot._admin_id", return_value=42),
+            patch("bot.delete_all_medicines", return_value=3) as delete_all,
+        ):
+            await medicine_delete_all_callback(update, context)
+
+        delete_all.assert_called_once_with()
+        self.assertNotIn("medicine_delete_all", context.user_data)
+        self.assertIn("Удалено препаратов: 3", message.reply_text.await_args.args[0])
 
     async def test_new_medicine_form_keeps_draft_until_save_and_returns_to_review(self) -> None:
         message = _FakeMessage()
